@@ -5,6 +5,7 @@ const crypto    = require('crypto');
 const fs        = require('fs').promises;
 const { execFile } = require('child_process');
 const ffmpegPath   = require('ffmpeg-static');
+const multipart    = require('parse-multipart');
 
 // Map extensions → MIME
 const extToMime = {
@@ -122,66 +123,31 @@ module.exports = async function (context, req) {
   }
   context.log(`Request Content-Type: ${contentType}`);
 
-  // 4) Extract boundary
-  const boundaryMatch = contentType.match(/boundary=(.+)$/);
-  if (!boundaryMatch) {
-    context.log.error('Cannot find boundary in Content-Type header');
-    context.res = { status: 400, body: 'Missing boundary in Content-Type' };
+  // 4) Use parse-multipart to extract uploaded file
+  let boundary;
+  try {
+    boundary = multipart.getBoundary(contentType);
+  } catch (e) {
+    context.log.error('Cannot parse boundary from Content-Type:', e);
+    context.res = { status: 400, body: 'Invalid multipart boundary' };
     return;
   }
-  const boundary     = boundaryMatch[1];
-  context.log(`Extracted boundary → "${boundary}"`);
-  const boundaryLine  = `--${boundary}`;
-  const closingMarker = `\r\n--${boundary}--`;
+  context.log(`Parsed boundary → "${boundary}"`);
 
-  // 5) Convert raw buffer to Latin1 string for header parsing
-  const rawStr = raw.toString('latin1');
+  const parts = multipart.Parse(raw, boundary);
+  context.log(`Parsed ${parts.length} part(s)`);
 
-  // 6) Find where the first part’s headers begin/end
-  const firstBoundaryIdx = rawStr.indexOf(boundaryLine);
-  if (firstBoundaryIdx < 0) {
-    context.log.error('Boundary not found in payload');
-    context.res = { status: 400, body: 'Invalid multipart payload' };
-    return;
-  }
-  // Skip past "--boundary\r\n"
-  const headerStart = firstBoundaryIdx + boundaryLine.length + 2; 
-  const headerEnd   = rawStr.indexOf('\r\n\r\n', headerStart);
-  if (headerEnd < 0) {
-    context.log.error('Could not find end of headers');
-    context.res = { status: 400, body: 'Malformed multipart headers' };
-    return;
-  }
-
-  // 7) Extract header block and parse name/filename/type
-  const headerSection = rawStr.slice(headerStart, headerEnd);
-  const nameMatch     = headerSection.match(/name="([^"]+)"/);
-  const filenameMatch = headerSection.match(/filename="([^"]+)"/);
-  const typeMatch     = headerSection.match(/Content-Type:\s*([^\r\n]+)/i);
-
-  const fieldName = nameMatch     ? nameMatch[1]     : undefined;
-  const filename  = filenameMatch ? filenameMatch[1] : undefined;
-  const mimeType  = typeMatch     ? typeMatch[1]     : 'application/octet-stream';
-  context.log(`Parsed part header: name="${fieldName}", filename="${filename}", type="${mimeType}"`);
-
-  // 8) Ensure the field name is exactly "audioFile"
-  if (fieldName !== 'audioFile') {
-    context.log.warn('No part named "audioFile" found. Available part name:', fieldName);
+  const filePart = parts.find(p => p.name === 'audioFile');
+  if (!filePart) {
+    context.log.warn('No form field named "audioFile" found');
     context.res = { status: 400, body: 'Missing form field "audioFile"' };
     return;
   }
 
-  // 9) Find the closing boundary marker to get the full file bytes
-  const dataStart  = headerEnd + 4; // skip past "\r\n\r\n"
-  const closingIdx = rawStr.indexOf(closingMarker, dataStart);
-  if (closingIdx < 0) {
-    context.log.error('Closing boundary not found');
-    context.res = { status: 400, body: 'Malformed multipart payload (no closing boundary)' };
-    return;
-  }
-  // Extract every byte from dataStart (inclusive) to closingIdx (exclusive)
-  const fileBuffer = raw.slice(dataStart, closingIdx);
-  context.log(`Extracted fileBuffer (size=${fileBuffer.length} bytes)`);
+  const fileBuffer = filePart.data;
+  const filename   = filePart.filename || 'input';
+  const mimeType   = filePart.type || 'application/octet-stream';
+  context.log(`Extracted fileBuffer (size=${fileBuffer.length} bytes, filename="${filename}")`);
 
   // 10) Prepare for splitting
   const fileForSplit = {
