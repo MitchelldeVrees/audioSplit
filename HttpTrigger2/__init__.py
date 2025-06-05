@@ -11,15 +11,14 @@ from openai import OpenAI
 # 1) Configure pydub to use the bundled ffmpeg/ffprobe (inside split_audio/bin)
 this_folder = os.path.dirname(__file__)
 bin_folder   = os.path.join(this_folder, "bin")
-ffmpeg_path  = os.path.join(bin_folder, "ffmpeg.exe")
-ffprobe_path = os.path.join(bin_folder, "ffprobe.exe")
+
 
 # Prepend bin_folder to PATH so ffmpeg/ffprobe are found automatically
 os.environ["PATH"] = bin_folder + os.pathsep + os.environ.get("PATH", "")
 
 # Tell pydub exactly where to find those executables:
-AudioSegment.converter = ffmpeg_path
-AudioSegment.ffprobe   = ffprobe_path
+AudioSegment.converter = os.path.join(bin_folder, "ffmpeg")
+AudioSegment.ffprobe   = os.path.join(bin_folder, "ffprobe")
 
 print(f"[DEBUG] pydub will use ffmpeg at: {AudioSegment.converter}")
 print(f"[DEBUG] pydub will use ffprobe at: {AudioSegment.ffprobe}")
