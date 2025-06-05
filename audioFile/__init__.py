@@ -1,6 +1,7 @@
 
 from pydub import AudioSegment
 import os
+import openai
 
 this_folder = os.path.dirname(__file__)
 bin_folder = os.path.join(this_folder, "bin")
@@ -17,11 +18,12 @@ print(f"[DEBUG] pydub will use ffmpeg at: {AudioSegment.converter}")
 print(f"[DEBUG] pydub will use ffprobe at: {AudioSegment.ffprobe}")
 print(f"[DEBUG] os.environ['PATH'] starts with: {os.environ['PATH'].split(os.pathsep)[0]}")
 
+openai.api_key = os.getenv("OPENAI_API_KEY", "")
+
 import azure.functions as func
 import cgi
 import io
 import json
-import base64
 async def main(req: func.HttpRequest) -> func.HttpResponse:
     # 1) Read the raw request body and Content-Type
     body_bytes   = req.get_body() or b""
@@ -72,7 +74,7 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     # 7) Split into 10-minute chunks (adjust as desired)
     chunk_length_ms = 10 * 60 * 1000  # 10 minutes in milliseconds
     total_length   = len(audio)
-    chunks = []
+    transcripts = []
     idx = 0
     for start_ms in range(0, total_length, chunk_length_ms):
         end_ms = min(start_ms + chunk_length_ms, total_length)
@@ -88,21 +90,25 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=500
             )
 
-        # 9) Base64‐encode the buffer
+        # 9) Transcribe the chunk using OpenAI Whisper
         buf.seek(0)
-        b64data = base64.b64encode(buf.read()).decode('utf-8')
+        buf.name = f"chunk_{idx:03d}.mp3"
+        try:
+            result = openai.Audio.transcribe("whisper-1", buf)
+            transcripts.append(result.get("text", ""))
+        except Exception as trans_err:
+            return func.HttpResponse(
+                f"Error transcribing chunk {idx}: {trans_err}",
+                status_code=500
+            )
 
-        chunk_name = f"chunk_{idx:03d}.mp3"
-        chunks.append({
-            "name": chunk_name,
-            "mime": "audio/mpeg",
-            "data": b64data
-        })
         idx += 1
 
-    # 10) Return a JSON array of chunks
+    full_text = " ".join(transcripts)
+
+    # 10) Return the combined transcription
     return func.HttpResponse(
-        body=json.dumps(chunks),
+        body=json.dumps({"transcript": full_text}),
         status_code=200,
         mimetype="application/json"
     )
