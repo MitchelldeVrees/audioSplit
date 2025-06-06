@@ -6,26 +6,30 @@ import base64
 import azure.functions as func
 from pydub import AudioSegment
 from openai import OpenAI
+import platform
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) Configure pydub to use the bundled ffmpeg/ffprobe (inside split_audio/bin)
-this_folder = os.path.dirname(__file__)
-bin_folder   = os.path.join(this_folder, "bin")
+this_folder = os.path.dirname(__file__)           # e.g. /Users/.../audioSplit/HttpTrigger2
+bin_folder   = os.path.join(this_folder, "bin")   # e.g. /Users/.../audioSplit/HttpTrigger2/bin
 
+current_system = platform.system().lower()   # "darwin" on Mac, "linux" on Azure
 
-# Prepend bin_folder to PATH so ffmpeg/ffprobe are found automatically
-os.environ["PATH"] = bin_folder + os.pathsep + os.environ.get("PATH", "")
-
-# Tell pydub exactly where to find those executables:
-AudioSegment.converter = os.path.join(bin_folder, "ffmpeg")
-AudioSegment.ffprobe   = os.path.join(bin_folder, "ffprobe")
-
-print(f"[DEBUG] pydub will use ffmpeg at: {AudioSegment.converter}")
-print(f"[DEBUG] pydub will use ffprobe at: {AudioSegment.ffprobe}")
-print(f"[DEBUG] os.environ['PATH'] starts with: {os.environ['PATH'].split(os.pathsep)[0]}")
+if current_system == "darwin":
+    # On macOS: use the Homebrew-installed binaries
+    AudioSegment.converter = "ffmpeg"
+    AudioSegment.ffprobe   = "ffprobe"
+    print("[DEBUG] macOS detected → using system ffmpeg/ffprobe")
+else:
+    # On Linux (i.e. Azure): use the bundled static binaries
+    ffmpeg_path  = os.path.join(bin_folder, "ffmpeg")
+    ffprobe_path = os.path.join(bin_folder, "ffprobe")
+    os.environ["PATH"] = bin_folder + os.pathsep + os.environ.get("PATH", "")
+    AudioSegment.converter = ffmpeg_path
+    AudioSegment.ffprobe   = ffprobe_path
+    print(f"[DEBUG] Linux detected → using ffmpeg at: {ffmpeg_path}")
+    print(f"[DEBUG] Linux detected → using ffprobe at: {ffprobe_path}")
 # ─────────────────────────────────────────────────────────────────────────────
 
-# 2) Create an OpenAI client (will read OPENAI_API_KEY from the environment by default)
 client = OpenAI()
 
 async def main(req: func.HttpRequest) -> func.HttpResponse:
