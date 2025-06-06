@@ -5,8 +5,9 @@ import json
 import base64
 import azure.functions as func
 from pydub import AudioSegment
-from openai import OpenAI
 import platform
+import asyncio
+import requests
 
 # ─────────────────────────────────────────────────────────────────────────────
 this_folder = os.path.dirname(__file__)           # e.g. /Users/.../audioSplit/HttpTrigger2
@@ -27,10 +28,29 @@ else:
     AudioSegment.converter = ffmpeg_path
     AudioSegment.ffprobe   = ffprobe_path
     print(f"[DEBUG] Linux detected → using ffmpeg at: {ffmpeg_path}")
-    print(f"[DEBUG] Linux detected → using ffprobe at: {ffprobe_path}")
+print(f"[DEBUG] Linux detected → using ffprobe at: {ffprobe_path}")
 # ─────────────────────────────────────────────────────────────────────────────
 
-client = OpenAI()
+FAL_API_URL = "https://fal.run/fal-ai/wizper"
+FAL_KEY = os.environ.get("FAL_KEY", "")
+
+if not FAL_KEY:
+    print("[WARNING] FAL_KEY environment variable not set")
+
+
+async def transcribe_buffer(buf: io.BytesIO) -> str:
+    """Send audio buffer to fal.ai wizper model and return the transcript."""
+
+    def _post() -> str:
+        buf.seek(0)
+        files = {"file": (buf.name or "audio.mp3", buf, "application/octet-stream")}
+        headers = {"Authorization": f"Key {FAL_KEY}"}
+        response = requests.post(FAL_API_URL, files=files, headers=headers, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("transcript", "")
+
+    return await asyncio.to_thread(_post)
 
 async def main(req: func.HttpRequest) -> func.HttpResponse:
     # 1) Read body + Content-Type
@@ -78,15 +98,11 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     # 7) Split into 10-minute chunks
     chunk_length_ms = 10 * 60 * 1000  # 10 minutes in milliseconds
     total_length    = len(audio)
-    transcripts     = []
-    idx = 0
+    transcripts = []
+    tasks = []
+    sem = asyncio.Semaphore(3)
 
-    for start_ms in range(0, total_length, chunk_length_ms):
-        end_ms = min(start_ms + chunk_length_ms, total_length)
-        segment = audio[start_ms:end_ms]
-
-        # 8) Export each segment to an in-memory buffer.
-        #    Use the original format when supported to avoid unnecessary re-encoding.
+    async def process_segment(segment, idx):
         buf = io.BytesIO()
         try:
             if target_format == "mp3":
@@ -94,21 +110,21 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
             else:
                 segment.export(buf, format=target_format)
         except Exception as export_err:
-            return func.HttpResponse(f"Error exporting chunk: {export_err}", status_code=500)
+            raise RuntimeError(f"Error exporting chunk {idx}: {export_err}") from export_err
 
-        # 9) Transcribe via Whisper
-        buf.seek(0)
         buf.name = f"chunk_{idx:03d}.{target_format}"
-        try:
-            result = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=buf
-            )
-            transcripts.append(result.text or "")
-        except Exception as trans_err:
-            return func.HttpResponse(f"Error transcribing chunk {idx}: {trans_err}", status_code=500)
+        async with sem:
+            return await transcribe_buffer(buf)
 
-        idx += 1
+    for idx, start_ms in enumerate(range(0, total_length, chunk_length_ms)):
+        end_ms = min(start_ms + chunk_length_ms, total_length)
+        segment = audio[start_ms:end_ms]
+        tasks.append(process_segment(segment, idx))
+
+    try:
+        transcripts = await asyncio.gather(*tasks)
+    except Exception as trans_err:
+        return func.HttpResponse(f"Error transcribing: {trans_err}", status_code=500)
 
     # 10) Combine all chunk texts into one big string
     full_text = " ".join(transcripts).strip()
