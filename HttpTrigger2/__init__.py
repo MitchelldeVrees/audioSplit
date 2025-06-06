@@ -32,7 +32,7 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     # 1) Read body + Content-Type
     body_bytes   = req.get_body() or b""
     content_type = req.headers.get('content-type', "")
-
+    print("Calling split_audio with:")
     # 2) Must be multipart/form-data
     if not content_type.startswith("multipart/form-data"):
         return func.HttpResponse(
@@ -60,6 +60,11 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     if not file_data:
         return func.HttpResponse('Uploaded file is empty', status_code=400)
 
+    # Determine the extension and whether we need to re-encode
+    ext = os.path.splitext(uploaded_filename)[1].lower().lstrip(".")
+    supported_formats = {"mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"}
+    target_format = ext if ext in supported_formats else "mp3"
+
     # 6) Load into pydub.AudioSegment
     try:
         audio = AudioSegment.from_file(io.BytesIO(file_data))
@@ -76,16 +81,20 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
         end_ms = min(start_ms + chunk_length_ms, total_length)
         segment = audio[start_ms:end_ms]
 
-        # 8) Export each segment to an in-memory MP3
+        # 8) Export each segment to an in-memory buffer.
+        #    Use the original format when supported to avoid unnecessary re-encoding.
         buf = io.BytesIO()
         try:
-            segment.export(buf, format="mp3", bitrate="128k")
+            if target_format == "mp3":
+                segment.export(buf, format="mp3", bitrate="128k")
+            else:
+                segment.export(buf, format=target_format)
         except Exception as export_err:
             return func.HttpResponse(f"Error exporting chunk: {export_err}", status_code=500)
 
         # 9) Transcribe via Whisper
         buf.seek(0)
-        buf.name = f"chunk_{idx:03d}.mp3"
+        buf.name = f"chunk_{idx:03d}.{target_format}"
         try:
             result = client.audio.transcriptions.create(
                 model="whisper-1",
