@@ -124,7 +124,13 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
     # 6) Determine extension & target_format
     ext = os.path.splitext(uploaded_filename)[1].lower().lstrip(".")
     supported_formats = {"mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"}
-    target_format = ext if ext in supported_formats else "mp3"
+    if ext not in supported_formats:
+        return func.HttpResponse(
+            f"Unsupported file extension '.{ext}'. Allowed: {', '.join(sorted(supported_formats))}",
+            status_code=400,
+        )
+
+    target_format = ext
 
     # 7) Load into pydub.AudioSegment
     try:
@@ -149,10 +155,13 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
             try:
+                ffmpeg_format = {
+                    "m4a": "ipod",
+                }.get(target_format, target_format)
                 if target_format == "mp3":
                     segment.export(tmp, format="mp3", bitrate="128k")
                 else:
-                    segment.export(tmp, format=target_format)
+                    segment.export(tmp, format=ffmpeg_format)
             except Exception as export_err:
                 os.unlink(tmp_path)  # cleanup
                 raise RuntimeError(f"Error exporting chunk {idx}: {export_err}") from export_err
