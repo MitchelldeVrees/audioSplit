@@ -1,3 +1,4 @@
 azure-functions
 pydub
 requests
+fal-client
