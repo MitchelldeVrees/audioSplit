@@ -5,197 +5,179 @@ import json
 import platform
 import tempfile
 import asyncio
+import logging
 
 import azure.functions as func
 from pydub import AudioSegment
 import fal_client  # the official Fal.ai SDK
 
+# Configure root logger to INFO level
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) Platform detection so we can pick the correct ffmpeg/ffprobe
-this_folder = os.path.dirname(__file__)           # e.g. /Users/.../audioSplit/HttpTrigger2
-bin_folder   = os.path.join(this_folder, "bin")   # e.g. /Users/.../audioSplit/HttpTrigger2/bin
-
-current_system = platform.system().lower()   # "darwin" on Mac, "linux" on Azure
-
+this_folder = os.path.dirname(__file__)
+bin_folder   = os.path.join(this_folder, "bin")
+current_system = platform.system().lower()
 if current_system == "darwin":
-    # On macOS: assume Homebrew-installed ffmpeg/ffprobe are on PATH
     AudioSegment.converter = "ffmpeg"
     AudioSegment.ffprobe   = "ffprobe"
-    print("[DEBUG] macOS detected → using system ffmpeg/ffprobe")
+    logger.debug("macOS detected → using system ffmpeg/ffprobe")
 else:
-    # On Linux (Azure): use the bundled static binaries
     ffmpeg_path  = os.path.join(bin_folder, "ffmpeg")
     ffprobe_path = os.path.join(bin_folder, "ffprobe")
     os.environ["PATH"] = bin_folder + os.pathsep + os.environ.get("PATH", "")
     AudioSegment.converter = ffmpeg_path
     AudioSegment.ffprobe   = ffprobe_path
-    print(f"[DEBUG] Linux detected → using ffmpeg at: {ffmpeg_path}")
-    print(f"[DEBUG] Linux detected → using ffprobe at: {ffprobe_path}")
+    logger.debug(f"Linux detected → using ffmpeg at: {ffmpeg_path}")
+    logger.debug(f"Linux detected → using ffprobe at: {ffprobe_path}")
 # ─────────────────────────────────────────────────────────────────────────────
 
-# 2) Fal.ai (wizper) settings
-FAL_KEY     = os.environ.get("FAL_KEY", "").strip()
-FAL_MODEL   = "fal-ai/wizper"
+# 2) Fal.ai settings
+FAL_KEY   = os.environ.get("FAL_KEY", "").strip()
+FAL_MODEL = "fal-ai/wizper"
 if not FAL_KEY:
-    print("[WARNING] FAL_KEY environment variable not set; Fal.ai calls will fail")
-
+    logger.warning("FAL_KEY environment variable not set; Fal.ai calls will fail")
+else:
+    logger.info("Fal.ai API key found; ready to transcribe")
 
 async def upload_and_transcribe_chunk(tmp_path: str) -> str:
-    """
-    1) Upload the file at tmp_path to Fal.ai storage.
-    2) Submit a wizper transcription job using the returned URL.
-    3) Wait for the result and return the 'text' field of the response.
-    """
-    # 1) Upload the chunk to Fal.ai’s storage
+    logger.info(f"Uploading chunk: {tmp_path}")
     try:
-        # fal_client.upload_file is synchronous; wrap it in to_thread
         audio_url = await asyncio.to_thread(fal_client.upload_file, tmp_path)
+        logger.debug(f"Uploaded chunk URL: {audio_url}")
     except Exception as e:
+        logger.error(f"Fal.ai upload_file failed: {e}")
         raise RuntimeError(f"Fal.ai upload_file failed: {e}") from e
 
-    # 2) Submit a wizper job
-    handler = None
+    logger.info(f"Submitting transcription job for URL: {audio_url}")
     try:
-        # fal_client.submit is synchronous as well
         handler = await asyncio.to_thread(
             fal_client.submit,
             FAL_MODEL,
-            {"audio_url": audio_url,  
-             "task": "transcribe",
-                  
-},
+            {"audio_url": audio_url, "task": "transcribe", "language": "nl"},
         )
+        request_id = handler.request_id
+        logger.debug(f"Received request ID: {request_id}")
     except Exception as e:
+        logger.error(f"Fal.ai submit failed: {e}")
         raise RuntimeError(f"Fal.ai submit(wizper) failed: {e}") from e
 
-    request_id = handler.request_id
-
-    # 3) Wait for the result (this polls until the job is complete)
-    result = None
+    logger.info(f"Polling result for request ID: {request_id}")
     try:
-        result = await asyncio.to_thread(
-            fal_client.result,
-            FAL_MODEL,
-            request_id,
-        )
+        result = await asyncio.to_thread(fal_client.result, FAL_MODEL, request_id)
+        logger.debug(f"Received result: {result}")
     except Exception as e:
+        logger.error(f"Fal.ai result failed: {e}")
         raise RuntimeError(f"Fal.ai result(wizper) failed: {e}") from e
 
-    # The JSON schema for wizper’s output includes a "text" field
     transcript = result.get("text", "")
     if transcript is None:
+        logger.error(f"Fal.ai returned no 'text' field: {result}")
         raise RuntimeError(f"Fal.ai returned no 'text' field: {result}")
+
+    logger.info(f"Chunk transcription complete, length={len(transcript)} chars")
     return transcript
 
-
 async def main(req: func.HttpRequest) -> func.HttpResponse:
-    # 1) Read body + Content-Type
+    logger.info("/HttpTrigger2 invoked")
+
+    # Read body & headers
     body_bytes   = req.get_body() or b""
     content_type = req.headers.get("content-type", "")
-    print("Calling split_audio with:")
+    logger.debug(f"Content-Type: {content_type}, Body size: {len(body_bytes)} bytes")
 
-    # 2) Must be multipart/form-data
     if not content_type.startswith("multipart/form-data"):
+        logger.error(f"Invalid Content-Type: {content_type}")
         return func.HttpResponse(
             "Invalid Content-Type. Must be multipart/form-data",
             status_code=400
         )
 
-    # 3) Parse multipart/form-data via cgi.FieldStorage
-    fp = io.BytesIO(body_bytes)
-    environ = {
-        "REQUEST_METHOD": "POST",
-        "CONTENT_TYPE": content_type
-    }
-    form = cgi.FieldStorage(fp=fp, environ=environ, keep_blank_values=True)
+    # Parse multipart data
+    try:
+        fp = io.BytesIO(body_bytes)
+        environ = {"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type}
+        form = cgi.FieldStorage(fp=fp, environ=environ, keep_blank_values=True)
+        logger.info("Parsed multipart/form-data")
+    except Exception as e:
+        logger.error(f"Failed to parse form-data: {e}")
+        return func.HttpResponse(f"Error parsing form-data: {e}", status_code=400)
 
-    # 4) Ensure we have audioFile field
     if "audioFile" not in form:
+        logger.error("Missing form field 'audioFile'")
         return func.HttpResponse('Missing form field "audioFile"', status_code=400)
 
-    file_item = form["audioFile"]  # a cgi.FieldStorage instance
-
-    # 5) Read the uploaded bytes
-    uploaded_filename = file_item.filename or "input.mp3"
+    file_item = form["audioFile"]
+    uploaded_filename = file_item.filename or "input"
     file_data         = file_item.file.read()
+    logger.info(f"Received file: {uploaded_filename}, size={len(file_data)} bytes")
+
     if not file_data:
+        logger.error("Uploaded file is empty")
         return func.HttpResponse('Uploaded file is empty', status_code=400)
 
-    # 6) Determine extension & target_format
-    ext = os.path.splitext(uploaded_filename)[1].lower().lstrip(".")
-    supported_formats = {"mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"}
-    if ext not in supported_formats:
+    # Validate extension
+    ext = os.path.splitext(uploaded_filename)[1].lower().lstrip('.')
+    supported = {"mp3","mp4","mpeg","mpga","m4a","wav","webm"}
+    if ext not in supported:
+        logger.error(f"Unsupported extension: {ext}")
         return func.HttpResponse(
-            f"Unsupported file extension '.{ext}'. Allowed: {', '.join(sorted(supported_formats))}",
-            status_code=400,
+            f"Unsupported file extension '.{ext}'", status_code=400
         )
+    logger.info(f"Processing as .{ext} format")
 
-    target_format = ext
-
-    # 7) Load into pydub.AudioSegment
+    # Load audio
     try:
-        audio = AudioSegment.from_file(io.BytesIO(file_data), format=target_format)
+        audio = AudioSegment.from_file(io.BytesIO(file_data), format=ext)
+        logger.info(f"Loaded audio, duration={len(audio)} ms")
     except Exception as e:
+        logger.error(f"Error loading audio: {e}")
         return func.HttpResponse(f"Error loading audio: {e}", status_code=400)
 
-    # 8) Split into 10‐minute chunks (in milliseconds)
-    chunk_length_ms = 10 * 60 * 1000
-    total_length    = len(audio)
+    # Split and transcribe
+    chunk_ms  = 10 * 60 * 1000
+    total_ms  = len(audio)
+    logger.info(f"Splitting into chunks of {chunk_ms} ms; total length {total_ms} ms")
 
-    transcripts = []
     tasks = []
-    sem = asyncio.Semaphore(3)  # limit concurrency to 3 chunks at a time
+    sem = asyncio.Semaphore(3)
 
-    async def process_segment(segment: AudioSegment, idx: int) -> str:
-        """
-        Export this segment to a temporary file, then upload & transcribe via Fal.ai.
-        """
-        # a) Export segment to a NamedTemporaryFile on disk
-        suffix = f".{target_format}"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
+    async def process(segment, idx):
+        logger.debug(f"Exporting chunk {idx}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+            path = tmp.name
             try:
-                ffmpeg_format = {
-                    "m4a": "ipod",
-                }.get(target_format, target_format)
-                if target_format == "mp3":
-                    segment.export(tmp, format="mp3", bitrate="128k")
-                else:
-                    segment.export(tmp, format=ffmpeg_format)
-            except Exception as export_err:
-                os.unlink(tmp_path)  # cleanup
-                raise RuntimeError(f"Error exporting chunk {idx}: {export_err}") from export_err
-
-        # b) Ensure other tasks can start only when semaphore allows
+                fmt = 'mp3' if ext=='mp3' else ext
+                segment.export(tmp, format=fmt)
+            except Exception as ex:
+                logger.error(f"Error exporting chunk {idx}: {ex}")
+                os.unlink(path)
+                raise
         async with sem:
             try:
-                transcript = await upload_and_transcribe_chunk(tmp_path)
+                return await upload_and_transcribe_chunk(path)
             finally:
-                # Always delete the temp file, even if transcription failed
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-            return transcript
+                try: os.unlink(path)
+                except: pass
 
-    # 9) Spawn a task for each chunk
-    for idx, start_ms in enumerate(range(0, total_length, chunk_length_ms)):
-        end_ms  = min(start_ms + chunk_length_ms, total_length)
-        segment = audio[start_ms:end_ms]
-        tasks.append(process_segment(segment, idx))
+    for idx, start in enumerate(range(0, total_ms, chunk_ms)):
+        end = min(start+chunk_ms, total_ms)
+        seg = audio[start:end]
+        tasks.append(process(seg, idx))
 
-    # 10) Await all transcription tasks
     try:
-        transcripts = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
     except Exception as e:
+        logger.error(f"Error during transcription: {e}")
         return func.HttpResponse(f"Error transcribing: {e}", status_code=500)
 
-    # 11) Combine all chunk texts into one big string
-    full_text = " ".join(transcripts).strip()
+    full = " ".join(results).strip()
+    logger.info(f"Transcription completed, total length={len(full)} chars")
 
-    # 12) Return JSON with only the full transcript
     return func.HttpResponse(
-        body=json.dumps({"transcript": full_text}),
+        body=json.dumps({"transcript": full}),
         status_code=200,
         mimetype="application/json"
     )
